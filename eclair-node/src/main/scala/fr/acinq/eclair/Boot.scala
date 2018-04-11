@@ -1,3 +1,19 @@
+/*
+ * Copyright 2018 ACINQ SAS
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package fr.acinq.eclair
 
 import java.io.File
@@ -9,26 +25,22 @@ import grizzled.slf4j.Logging
   */
 object Boot extends App with Logging {
 
-  case class CmdLineConfig(datadir: File = new File(System.getProperty("user.home"), ".eclair"))
-
-  val parser = new scopt.OptionParser[CmdLineConfig]("eclair") {
-    head("eclair", s"${getClass.getPackage.getImplementationVersion} (commit: ${getClass.getPackage.getSpecificationVersion})")
-    help("help").abbr("h").text("display usage text")
-    opt[File]("datadir").optional().valueName("<file>").action((x, c) => c.copy(datadir = x)).text("optional data directory, default is ~/.eclair")
-  }
+  val datadir = new File(System.getProperty("eclair.datadir", System.getProperty("user.home") + "/.eclair"))
 
   try {
-    parser.parse(args, CmdLineConfig()) match {
-      case Some(config) =>
-        LogSetup.logTo(config.datadir)
-        new Setup(config.datadir).bootstrap
-      case None => System.exit(0)
+    import scala.concurrent.ExecutionContext.Implicits.global
+    new Setup(datadir).bootstrap onFailure {
+      case t: Throwable => onError(t)
     }
   } catch {
-    case t: Throwable =>
-      System.err.println(s"fatal error: ${t.getMessage}")
-      logger.error(s"fatal error: ${t.getMessage}")
-      System.exit(1)
+    case t: Throwable => onError(t)
+  }
+
+  def onError(t: Throwable): Unit = {
+    val errorMsg = if (t.getMessage != null) t.getMessage else t.getClass.getSimpleName
+    System.err.println(s"fatal error: $errorMsg")
+    logger.error(s"fatal error: $errorMsg")
+    System.exit(1)
   }
 }
 

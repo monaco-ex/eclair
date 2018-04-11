@@ -1,3 +1,19 @@
+/*
+ * Copyright 2018 ACINQ SAS
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package fr.acinq.eclair.integration
 
 import java.io.{File, PrintWriter}
@@ -7,18 +23,22 @@ import java.util.{Properties, UUID}
 import akka.actor.{Actor, ActorRef, ActorSystem, Props}
 import akka.pattern.pipe
 import akka.testkit.{TestKit, TestProbe}
+import com.google.common.net.HostAndPort
 import com.typesafe.config.{Config, ConfigFactory}
-import fr.acinq.bitcoin.Crypto.{PrivateKey, PublicKey}
-import fr.acinq.bitcoin.{Base58, Base58Check, BinaryData, Crypto, MilliSatoshi, Satoshi, Script}
-import fr.acinq.eclair.blockchain.rpc.BitcoinJsonRPCClient
-import fr.acinq.eclair.blockchain.{ExtendedBitcoinClient, Watch, WatchConfirmed}
+import fr.acinq.bitcoin.Crypto.PublicKey
+import fr.acinq.bitcoin.{Base58, Base58Check, Bech32, BinaryData, Block, Crypto, MilliSatoshi, OP_0, OP_CHECKSIG, OP_DUP, OP_EQUAL, OP_EQUALVERIFY, OP_HASH160, OP_PUSHDATA, Satoshi, Script, ScriptFlags, Transaction}
+import fr.acinq.eclair.blockchain.bitcoind.rpc.{BasicBitcoinJsonRPCClient, BitcoinJsonRPCClient, ExtendedBitcoinClient}
+import fr.acinq.eclair.blockchain.{Watch, WatchConfirmed}
 import fr.acinq.eclair.channel.Register.Forward
 import fr.acinq.eclair.channel._
 import fr.acinq.eclair.crypto.Sphinx.ErrorPacket
-import fr.acinq.eclair.io.Disconnect
-import fr.acinq.eclair.io.Switchboard.{NewChannel, NewConnection}
-import fr.acinq.eclair.payment.{State => _, _}
+import fr.acinq.eclair.io.Peer.Disconnect
+import fr.acinq.eclair.io.{NodeURI, Peer}
+import fr.acinq.eclair.payment.PaymentLifecycle.{State => _, _}
+import fr.acinq.eclair.payment.{LocalPaymentHandler, PaymentRequest}
 import fr.acinq.eclair.router.{Announcements, AnnouncementsBatchValidationSpec}
+import fr.acinq.eclair.transactions.Transactions
+import fr.acinq.eclair.transactions.Transactions.{HtlcSuccessTx, HtlcTimeoutTx}
 import fr.acinq.eclair.wire._
 import fr.acinq.eclair.{Globals, Kit, Setup}
 import grizzled.slf4j.Logging
@@ -42,14 +62,13 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
   val INTEGRATION_TMP_DIR = s"${System.getProperty("buildDirectory")}/integration-${UUID.randomUUID().toString}"
   logger.info(s"using tmp dir: $INTEGRATION_TMP_DIR")
 
-  val PATH_BITCOIND = new File(System.getProperty("buildDirectory"), "bitcoin-0.14.0/bin/bitcoind")
+  val PATH_BITCOIND = new File(System.getProperty("buildDirectory"), "bitcoin-0.16.0/bin/bitcoind")
   val PATH_BITCOIND_DATADIR = new File(INTEGRATION_TMP_DIR, "datadir-bitcoin")
 
   var bitcoind: Process = null
   var bitcoinrpcclient: BitcoinJsonRPCClient = null
   var bitcoincli: ActorRef = null
   var nodes: Map[String, Kit] = Map()
-  var finalAddresses: Map[String, String] = Map()
 
   implicit val formats = DefaultFormats
 
@@ -60,7 +79,7 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     Files.copy(classOf[IntegrationSpec].getResourceAsStream("/integration/bitcoin.conf"), new File(PATH_BITCOIND_DATADIR.toString, "bitcoin.conf").toPath)
 
     bitcoind = s"$PATH_BITCOIND -datadir=$PATH_BITCOIND_DATADIR".run()
-    bitcoinrpcclient = new BitcoinJsonRPCClient(user = "foo", password = "bar", host = "localhost", port = 28332)
+    bitcoinrpcclient = new BasicBitcoinJsonRPCClient(user = "foo", password = "bar", host = "localhost", port = 28332)
     bitcoincli = system.actorOf(Props(new Actor {
       override def receive: Receive = {
         case BitcoinReq(method) => bitcoinrpcclient.invoke(method) pipeTo sender
@@ -75,7 +94,7 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     val sender = TestProbe()
     sender.send(bitcoincli, BitcoinReq("stop"))
     sender.expectMsgType[JValue]
-    //bitcoind.destroy()
+    bitcoind.exitValue()
     nodes.foreach {
       case (name, setup) =>
         logger.info(s"stopping node $name")
@@ -90,12 +109,12 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     val sender = TestProbe()
     logger.info(s"waiting for bitcoind to initialize...")
     awaitCond({
-      sender.send(bitcoincli, BitcoinReq("getinfo"))
+      sender.send(bitcoincli, BitcoinReq("getnetworkinfo"))
       sender.receiveOne(5 second).isInstanceOf[JValue]
     }, max = 30 seconds, interval = 500 millis)
     logger.info(s"generating initial blocks...")
     sender.send(bitcoincli, BitcoinReq("generate", 500))
-    sender.expectMsgType[JValue](10 seconds)
+    sender.expectMsgType[JValue](30 seconds)
   }
 
   def instantiateEclairNode(name: String, config: Config) = {
@@ -107,7 +126,6 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     }
     val setup = new Setup(datadir, actorSystem = ActorSystem(s"system-$name"))
     val kit = Await.result(setup.bootstrap, 10 seconds)
-    finalAddresses = finalAddresses + (name -> setup.finalAddress)
     nodes = nodes + (name -> kit)
   }
 
@@ -119,99 +137,74 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
 
   test("starting eclair nodes") {
     import collection.JavaConversions._
-    val commonConfig = ConfigFactory.parseMap(Map("eclair.server.public-ips.1" -> "localhost", "eclair.bitcoind.port" -> 28333, "eclair.bitcoind.rpcport" -> 28332, "eclair.bitcoind.zmq" -> "tcp://127.0.0.1:28334", "eclair.router-broadcast-interval" -> "2 second", "eclair.auto-reconnect" -> false))
-    instantiateEclairNode("A", ConfigFactory.parseMap(Map("eclair.node-alias" -> "A", "eclair.server.port" -> 29730, "eclair.api.port" -> 28080)).withFallback(commonConfig))
-    instantiateEclairNode("B", ConfigFactory.parseMap(Map("eclair.node-alias" -> "B", "eclair.server.port" -> 29731, "eclair.api.port" -> 28081)).withFallback(commonConfig))
-    instantiateEclairNode("C", ConfigFactory.parseMap(Map("eclair.node-alias" -> "C", "eclair.server.port" -> 29732, "eclair.api.port" -> 28082)).withFallback(commonConfig))
-    instantiateEclairNode("D", ConfigFactory.parseMap(Map("eclair.node-alias" -> "D", "eclair.server.port" -> 29733, "eclair.api.port" -> 28083)).withFallback(commonConfig))
-    instantiateEclairNode("E", ConfigFactory.parseMap(Map("eclair.node-alias" -> "E", "eclair.server.port" -> 29734, "eclair.api.port" -> 28084)).withFallback(commonConfig))
-    instantiateEclairNode("F1", ConfigFactory.parseMap(Map("eclair.node-alias" -> "F1", "eclair.server.port" -> 29735, "eclair.api.port" -> 28085, "eclair.payment-handler" -> "noop")).withFallback(commonConfig)) // NB: eclair.payment-handler = noop allows us to manually fulfill htlcs
-    instantiateEclairNode("F2", ConfigFactory.parseMap(Map("eclair.node-alias" -> "F2", "eclair.server.port" -> 29736, "eclair.api.port" -> 28086, "eclair.payment-handler" -> "noop")).withFallback(commonConfig))
-    instantiateEclairNode("F3", ConfigFactory.parseMap(Map("eclair.node-alias" -> "F3", "eclair.server.port" -> 29737, "eclair.api.port" -> 28087, "eclair.payment-handler" -> "noop")).withFallback(commonConfig))
-    instantiateEclairNode("F4", ConfigFactory.parseMap(Map("eclair.node-alias" -> "F4", "eclair.server.port" -> 29738, "eclair.api.port" -> 28088, "eclair.payment-handler" -> "noop")).withFallback(commonConfig))
+    val commonConfig = ConfigFactory.parseMap(Map("eclair.chain" -> "regtest", "eclair.spv" -> false, "eclair.server.public-ips.1" -> "localhost", "eclair.bitcoind.port" -> 28333, "eclair.bitcoind.rpcport" -> 28332, "eclair.bitcoind.zmq" -> "tcp://127.0.0.1:28334", "eclair.mindepth-blocks" -> 2, "eclair.max-htlc-value-in-flight-msat" -> 100000000000L, "eclair.router-broadcast-interval" -> "2 second", "eclair.auto-reconnect" -> false))
+    instantiateEclairNode("A", ConfigFactory.parseMap(Map("eclair.node-alias" -> "A", "eclair.delay-blocks" -> 130, "eclair.server.port" -> 29730, "eclair.api.port" -> 28080, "eclair.channel-flags" -> 0)).withFallback(commonConfig)) // A's channels are private
+    instantiateEclairNode("B", ConfigFactory.parseMap(Map("eclair.node-alias" -> "B", "eclair.delay-blocks" -> 131, "eclair.server.port" -> 29731, "eclair.api.port" -> 28081)).withFallback(commonConfig))
+    instantiateEclairNode("C", ConfigFactory.parseMap(Map("eclair.node-alias" -> "C", "eclair.delay-blocks" -> 132, "eclair.server.port" -> 29732, "eclair.api.port" -> 28082, "eclair.payment-handler" -> "noop")).withFallback(commonConfig))
+    instantiateEclairNode("D", ConfigFactory.parseMap(Map("eclair.node-alias" -> "D", "eclair.delay-blocks" -> 133, "eclair.server.port" -> 29733, "eclair.api.port" -> 28083)).withFallback(commonConfig))
+    instantiateEclairNode("E", ConfigFactory.parseMap(Map("eclair.node-alias" -> "E", "eclair.delay-blocks" -> 134, "eclair.server.port" -> 29734, "eclair.api.port" -> 28084)).withFallback(commonConfig))
+    instantiateEclairNode("F1", ConfigFactory.parseMap(Map("eclair.node-alias" -> "F1", "eclair.delay-blocks" -> 135, "eclair.server.port" -> 29735, "eclair.api.port" -> 28085, "eclair.payment-handler" -> "noop")).withFallback(commonConfig)) // NB: eclair.payment-handler = noop allows us to manually fulfill htlcs
+    instantiateEclairNode("F2", ConfigFactory.parseMap(Map("eclair.node-alias" -> "F2", "eclair.delay-blocks" -> 136, "eclair.server.port" -> 29736, "eclair.api.port" -> 28086, "eclair.payment-handler" -> "noop")).withFallback(commonConfig))
+    instantiateEclairNode("F3", ConfigFactory.parseMap(Map("eclair.node-alias" -> "F3", "eclair.delay-blocks" -> 137, "eclair.server.port" -> 29737, "eclair.api.port" -> 28087, "eclair.payment-handler" -> "noop")).withFallback(commonConfig))
+    instantiateEclairNode("F4", ConfigFactory.parseMap(Map("eclair.node-alias" -> "F4", "eclair.delay-blocks" -> 138, "eclair.server.port" -> 29738, "eclair.api.port" -> 28088, "eclair.payment-handler" -> "noop")).withFallback(commonConfig))
+    instantiateEclairNode("F5", ConfigFactory.parseMap(Map("eclair.node-alias" -> "F5", "eclair.delay-blocks" -> 139, "eclair.server.port" -> 29739, "eclair.api.port" -> 28089, "eclair.payment-handler" -> "noop")).withFallback(commonConfig))
+
+    // by default C has a normal payment handler, but this can be overriden in tests
+    val paymentHandlerC = nodes("C").system.actorOf(LocalPaymentHandler.props(nodes("C").nodeParams))
+    nodes("C").paymentHandler ! paymentHandlerC
   }
 
   def connect(node1: Kit, node2: Kit, fundingSatoshis: Long, pushMsat: Long) = {
-    val eventListener1 = TestProbe()
-    val eventListener2 = TestProbe()
-    node1.system.eventStream.subscribe(eventListener1.ref, classOf[ChannelStateChanged])
-    node2.system.eventStream.subscribe(eventListener2.ref, classOf[ChannelStateChanged])
     val sender = TestProbe()
-    sender.send(node1.switchboard, NewConnection(
-      remoteNodeId = node2.nodeParams.privateKey.publicKey,
-      address = node2.nodeParams.publicAddresses.head,
-      newChannel_opt = Some(NewChannel(Satoshi(fundingSatoshis), MilliSatoshi(pushMsat), None))))
-    sender.expectMsgAnyOf(10 seconds, "connected", s"already connected to nodeId=${node2.nodeParams.privateKey.publicKey.toBin}")
-    // funder transitions
-    assert(eventListener1.expectMsgType[ChannelStateChanged](10 seconds).currentState == WAIT_FOR_ACCEPT_CHANNEL)
-    assert(eventListener1.expectMsgType[ChannelStateChanged](10 seconds).currentState == WAIT_FOR_FUNDING_INTERNAL)
-    assert(eventListener1.expectMsgType[ChannelStateChanged](10 seconds).currentState == WAIT_FOR_FUNDING_PARENT)
-    // fundee transitions
-    assert(eventListener2.expectMsgType[ChannelStateChanged](10 seconds).currentState == WAIT_FOR_OPEN_CHANNEL)
-    assert(eventListener2.expectMsgType[ChannelStateChanged](10 seconds).currentState == WAIT_FOR_FUNDING_CREATED)
+    val address = node2.nodeParams.publicAddresses.head
+    sender.send(node1.switchboard, Peer.Connect(NodeURI(
+      nodeId = node2.nodeParams.nodeId,
+      address = HostAndPort.fromParts(address.getHostString, address.getPort))))
+    sender.expectMsgAnyOf(10 seconds, "connected", "already connected")
+    sender.send(node1.switchboard, Peer.OpenChannel(
+      remoteNodeId = node2.nodeParams.nodeId,
+      fundingSatoshis = Satoshi(fundingSatoshis),
+      pushMsat = MilliSatoshi(pushMsat),
+      fundingTxFeeratePerKw_opt = None,
+      channelFlags = None))
+    assert(sender.expectMsgType[String](10 seconds).startsWith("created channel"))
   }
 
   test("connect nodes") {
     //
-    // A ---- B ---- C ---- D
+    // A ---- B ---- C ==== D
     //        |     / \
-    //        --E--'   F{1,2,3,4}
+    //        --E--'   F{1,2,3,4,5}
     //
-
-    connect(nodes("A"), nodes("B"), 10000000, 0)
-    connect(nodes("B"), nodes("C"), 2000000, 0)
-    connect(nodes("C"), nodes("D"), 5000000, 0)
-    connect(nodes("B"), nodes("E"), 5000000, 0)
-    connect(nodes("E"), nodes("C"), 5000000, 0)
-    connect(nodes("C"), nodes("F1"), 5000000, 0)
-    connect(nodes("C"), nodes("F2"), 5000000, 0)
-    connect(nodes("C"), nodes("F3"), 5000000, 0)
-    connect(nodes("C"), nodes("F4"), 5000000, 0)
 
     val sender = TestProbe()
     val eventListener = TestProbe()
     nodes.values.foreach(_.system.eventStream.subscribe(eventListener.ref, classOf[ChannelStateChanged]))
 
-    // a channel has two endpoints
-    val channelEndpointsCount = nodes.values.foldLeft(0) {
-      case (sum, setup) =>
-        sender.send(setup.register, 'channels)
-        val channels = sender.expectMsgType[Map[BinaryData, ActorRef]]
-        sum + channels.size
-    }
+    connect(nodes("A"), nodes("B"), 10000000, 0)
+    connect(nodes("B"), nodes("C"), 2000000, 0)
+    connect(nodes("C"), nodes("D"), 5000000, 0)
+    connect(nodes("C"), nodes("D"), 5000000, 0)
+    connect(nodes("B"), nodes("E"), 10000000, 0)
+    connect(nodes("E"), nodes("C"), 10000000, 0)
+    connect(nodes("C"), nodes("F1"), 5000000, 0)
+    connect(nodes("C"), nodes("F2"), 5000000, 0)
+    connect(nodes("C"), nodes("F3"), 5000000, 0)
+    connect(nodes("C"), nodes("F4"), 5000000, 0)
+    connect(nodes("C"), nodes("F5"), 5000000, 0)
 
-    // each funder sets up a WatchConfirmed on the parent tx, we need to make sure it has been received by the watcher
-    var watches1 = Set.empty[Watch]
-    awaitCond({
-      watches1 = nodes.values.foldLeft(Set.empty[Watch]) {
-        case (watches, setup) =>
-          sender.send(setup.watcher, 'watches)
-          watches ++ sender.expectMsgType[Set[Watch]]
-      }
-      watches1.count(_.isInstanceOf[WatchConfirmed]) == channelEndpointsCount / 2
-    }, max = 10 seconds, interval = 1 second)
-
-    // confirming the parent tx of the funding
-    sender.send(bitcoincli, BitcoinReq("generate", 1))
-    sender.expectMsgType[JValue](10 seconds)
-
-    within(30 seconds) {
-      var count = 0
-      while (count < channelEndpointsCount) {
-        if (eventListener.expectMsgType[ChannelStateChanged](10 seconds).currentState == WAIT_FOR_FUNDING_CONFIRMED) count = count + 1
-      }
-    }
+    val numberOfChannels = 11
+    val channelEndpointsCount = 2 * numberOfChannels
 
     // we make sure all channels have set up their WatchConfirmed for the funding tx
     awaitCond({
-      val watches2 = nodes.values.foldLeft(Set.empty[Watch]) {
+      val watches = nodes.values.foldLeft(Set.empty[Watch]) {
         case (watches, setup) =>
           sender.send(setup.watcher, 'watches)
           watches ++ sender.expectMsgType[Set[Watch]]
       }
-      (watches2 -- watches1).count(_.isInstanceOf[WatchConfirmed]) == channelEndpointsCount
-    }, max = 10 seconds, interval = 1 second)
-
+      watches.count(_.isInstanceOf[WatchConfirmed]) == channelEndpointsCount
+    }, max = 20 seconds, interval = 1 second)
 
     // confirming the funding tx
     sender.send(bitcoincli, BitcoinReq("generate", 2))
@@ -231,15 +224,15 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
       case (_, setup) =>
         awaitCond({
           sender.send(setup.router, 'nodes)
-          sender.expectMsgType[Iterable[NodeAnnouncement]].size == nodes
+          sender.expectMsgType[Iterable[NodeAnnouncement]](20 seconds).size == nodes
         }, max = 60 seconds, interval = 1 second)
         awaitCond({
           sender.send(setup.router, 'channels)
-          sender.expectMsgType[Iterable[ChannelAnnouncement]].size == channels
+          sender.expectMsgType[Iterable[ChannelAnnouncement]](20 seconds).size == channels
         }, max = 60 seconds, interval = 1 second)
         awaitCond({
           sender.send(setup.router, 'updates)
-          sender.expectMsgType[Iterable[ChannelUpdate]].size == updates
+          sender.expectMsgType[Iterable[ChannelUpdate]](20 seconds).size == updates
         }, max = 60 seconds, interval = 1 second)
     }
   }
@@ -249,54 +242,58 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     // generating more blocks so that all funding txes are buried under at least 6 blocks
     sender.send(bitcoincli, BitcoinReq("generate", 4))
     sender.expectMsgType[JValue]
-    awaitAnnouncements(nodes, 9, 9, 18)
+    // A requires private channels, as a consequence:
+    // - only A and B now about channel A-B
+    // - A is not announced
+    awaitAnnouncements(nodes.filterKeys(key => List("A", "B").contains(key)), 9, 10, 22)
+    awaitAnnouncements(nodes.filterKeys(key => !List("A", "B").contains(key)), 9, 10, 20)
   }
 
   test("send an HTLC A->D") {
     val sender = TestProbe()
     val amountMsat = MilliSatoshi(4200000)
     // first we retrieve a payment hash from D
-    sender.send(nodes("D").paymentHandler, ReceivePayment(amountMsat, "1 coffee"))
+    sender.send(nodes("D").paymentHandler, ReceivePayment(Some(amountMsat), "1 coffee"))
     val pr = sender.expectMsgType[PaymentRequest]
     // then we make the actual payment
     sender.send(nodes("A").paymentInitiator,
-      SendPayment(amountMsat.amount, pr.paymentHash, nodes("D").nodeParams.privateKey.publicKey))
+      SendPayment(amountMsat.amount, pr.paymentHash, nodes("D").nodeParams.nodeId))
     sender.expectMsgType[PaymentSucceeded]
   }
 
-  test("send an HTLC A->D with an invalid expiry delta for C") {
+  // TODO: reenable this test
+  ignore("send an HTLC A->D with an invalid expiry delta for B") {
     val sender = TestProbe()
-    // to simulate this, we will update C's relay params
-    // first we find out the short channel id for channel C-D, easiest way is to ask D's register which has only one channel
-    sender.send(nodes("D").register, 'shortIds)
-    val shortIdCD = sender.expectMsgType[Map[Long, BinaryData]].keys.head
-    val channelUpdateCD = Announcements.makeChannelUpdate(nodes("C").nodeParams.privateKey, nodes("D").nodeParams.privateKey.publicKey, shortIdCD, nodes("D").nodeParams.expiryDeltaBlocks + 1, nodes("D").nodeParams.htlcMinimumMsat, nodes("D").nodeParams.feeBaseMsat, nodes("D").nodeParams.feeProportionalMillionth)
-    sender.send(nodes("C").relayer, channelUpdateCD)
+    // to simulate this, we will update B's relay params
+    // first we find out the short channel id for channel B-C
+    sender.send(nodes("B").router, 'channels)
+    val shortIdBC = sender.expectMsgType[Iterable[ChannelAnnouncement]].find(c => Set(c.nodeId1, c.nodeId2) == Set(nodes("B").nodeParams.nodeId, nodes("C").nodeParams.nodeId)).get.shortChannelId
+    val channelUpdateBC = Announcements.makeChannelUpdate(Block.RegtestGenesisBlock.hash, nodes("B").nodeParams.privateKey, nodes("C").nodeParams.nodeId, shortIdBC, nodes("B").nodeParams.expiryDeltaBlocks + 1, nodes("C").nodeParams.htlcMinimumMsat, nodes("B").nodeParams.feeBaseMsat, nodes("B").nodeParams.feeProportionalMillionth)
+    sender.send(nodes("B").relayer, channelUpdateBC)
     // first we retrieve a payment hash from D
     val amountMsat = MilliSatoshi(4200000)
-    sender.send(nodes("D").paymentHandler, ReceivePayment(amountMsat, "1 coffee"))
+    sender.send(nodes("D").paymentHandler, ReceivePayment(Some(amountMsat), "1 coffee"))
     val pr = sender.expectMsgType[PaymentRequest]
     // then we make the actual payment
-    val sendReq = SendPayment(amountMsat.amount, pr.paymentHash, nodes("D").nodeParams.privateKey.publicKey)
+    val sendReq = SendPayment(amountMsat.amount, pr.paymentHash, nodes("D").nodeParams.nodeId)
     sender.send(nodes("A").paymentInitiator, sendReq)
-    // A will receive an error from C that include the updated channel update, then will retry the payment
+    // A will receive an error from B that include the updated channel update, then will retry the payment
     sender.expectMsgType[PaymentSucceeded](5 seconds)
     // in the meantime, the router will have updated its state
     awaitCond({
       sender.send(nodes("A").router, 'updates)
-      sender.expectMsgType[Iterable[ChannelUpdate]].toSeq.contains(channelUpdateCD)
+      sender.expectMsgType[Iterable[ChannelUpdate]].toSeq.contains(channelUpdateBC)
     }, max = 20 seconds, interval = 1 second)
-    // finally we retry the same payment, this time successfully
   }
 
-  test("send an HTLC A->D with an amount greater than capacity of C-D") {
+  test("send an HTLC A->D with an amount greater than capacity of B-C") {
     val sender = TestProbe()
     // first we retrieve a payment hash from D
     val amountMsat = MilliSatoshi(300000000L)
-    sender.send(nodes("D").paymentHandler, ReceivePayment(amountMsat, "1 coffee"))
+    sender.send(nodes("D").paymentHandler, ReceivePayment(Some(amountMsat), "1 coffee"))
     val pr = sender.expectMsgType[PaymentRequest]
-    // then we make the payment (C-D has a smaller capacity than A-B and B-C)
-    val sendReq = SendPayment(amountMsat.amount, pr.paymentHash, nodes("D").nodeParams.privateKey.publicKey)
+    // then we make the payment (B-C has a smaller capacity than A-B and C-D)
+    val sendReq = SendPayment(amountMsat.amount, pr.paymentHash, nodes("D").nodeParams.nodeId)
     sender.send(nodes("A").paymentInitiator, sendReq)
     // A will first receive an error from C, then retry and route around C: A->B->E->C->D
     sender.expectMsgType[PaymentSucceeded](5 seconds)
@@ -304,75 +301,106 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
 
   test("send an HTLC A->D with an unknown payment hash") {
     val sender = TestProbe()
-    val pr = SendPayment(100000000L, "42" * 32, nodes("D").nodeParams.privateKey.publicKey)
+    val pr = SendPayment(100000000L, "42" * 32, nodes("D").nodeParams.nodeId)
     sender.send(nodes("A").paymentInitiator, pr)
 
-    // A will first receive an error from C, then retry and route around C: A->B->E->C->D
+    // A will receive an error from D and won't retry
     val failed = sender.expectMsgType[PaymentFailed]
     assert(failed.paymentHash === pr.paymentHash)
     assert(failed.failures.size === 1)
-    assert(failed.failures.head.asInstanceOf[RemoteFailure].e === ErrorPacket(nodes("D").nodeParams.privateKey.publicKey, UnknownPaymentHash))
+    assert(failed.failures.head.asInstanceOf[RemoteFailure].e === ErrorPacket(nodes("D").nodeParams.nodeId, UnknownPaymentHash))
   }
 
   test("send an HTLC A->D with a lower amount than requested") {
     val sender = TestProbe()
     // first we retrieve a payment hash from D for 2 mBTC
     val amountMsat = MilliSatoshi(200000000L)
-    sender.send(nodes("D").paymentHandler, ReceivePayment(amountMsat, "1 coffee"))
+    sender.send(nodes("D").paymentHandler, ReceivePayment(Some(amountMsat), "1 coffee"))
     val pr = sender.expectMsgType[PaymentRequest]
 
     // A send payment of only 1 mBTC
-    val sendReq = SendPayment(100000000L, pr.paymentHash, nodes("D").nodeParams.privateKey.publicKey)
+    val sendReq = SendPayment(100000000L, pr.paymentHash, nodes("D").nodeParams.nodeId)
     sender.send(nodes("A").paymentInitiator, sendReq)
 
     // A will first receive an IncorrectPaymentAmount error from D
     val failed = sender.expectMsgType[PaymentFailed]
     assert(failed.paymentHash === pr.paymentHash)
     assert(failed.failures.size === 1)
-    assert(failed.failures.head.asInstanceOf[RemoteFailure].e === ErrorPacket(nodes("D").nodeParams.privateKey.publicKey, IncorrectPaymentAmount))
+    assert(failed.failures.head.asInstanceOf[RemoteFailure].e === ErrorPacket(nodes("D").nodeParams.nodeId, IncorrectPaymentAmount))
   }
 
   test("send an HTLC A->D with too much overpayment") {
     val sender = TestProbe()
     // first we retrieve a payment hash from D for 2 mBTC
     val amountMsat = MilliSatoshi(200000000L)
-    sender.send(nodes("D").paymentHandler, ReceivePayment(amountMsat, "1 coffee"))
+    sender.send(nodes("D").paymentHandler, ReceivePayment(Some(amountMsat), "1 coffee"))
     val pr = sender.expectMsgType[PaymentRequest]
 
     // A send payment of 6 mBTC
-    val sendReq = SendPayment(600000000L, pr.paymentHash, nodes("D").nodeParams.privateKey.publicKey)
+    val sendReq = SendPayment(600000000L, pr.paymentHash, nodes("D").nodeParams.nodeId)
     sender.send(nodes("A").paymentInitiator, sendReq)
 
     // A will first receive an IncorrectPaymentAmount error from D
     val failed = sender.expectMsgType[PaymentFailed]
     assert(failed.paymentHash === pr.paymentHash)
     assert(failed.failures.size === 1)
-    assert(failed.failures.head.asInstanceOf[RemoteFailure].e === ErrorPacket(nodes("D").nodeParams.privateKey.publicKey, IncorrectPaymentAmount))
+    assert(failed.failures.head.asInstanceOf[RemoteFailure].e === ErrorPacket(nodes("D").nodeParams.nodeId, IncorrectPaymentAmount))
   }
 
   test("send an HTLC A->D with a reasonable overpayment") {
     val sender = TestProbe()
     // first we retrieve a payment hash from D for 2 mBTC
     val amountMsat = MilliSatoshi(200000000L)
-    sender.send(nodes("D").paymentHandler, ReceivePayment(amountMsat, "1 coffee"))
+    sender.send(nodes("D").paymentHandler, ReceivePayment(Some(amountMsat), "1 coffee"))
     val pr = sender.expectMsgType[PaymentRequest]
 
     // A send payment of 3 mBTC, more than asked but it should still be accepted
-    val sendReq = SendPayment(300000000L, pr.paymentHash, nodes("D").nodeParams.privateKey.publicKey)
+    val sendReq = SendPayment(300000000L, pr.paymentHash, nodes("D").nodeParams.nodeId)
     sender.send(nodes("A").paymentInitiator, sendReq)
     sender.expectMsgType[PaymentSucceeded]
   }
 
+  test("send multiple HTLCs A->D with a failover when a channel gets exhausted") {
+    val sender = TestProbe()
+    // there are two C-D channels with 5000000 sat, so we should be able to make 7 payments worth 1000000 sat each
+    for (i <- 0 until 7) {
+      // first we retrieve a payment hash from D for 2 mBTC
+      val amountMsat = MilliSatoshi(1000000000L)
+      sender.send(nodes("D").paymentHandler, ReceivePayment(Some(amountMsat), "1 payment"))
+      val pr = sender.expectMsgType[PaymentRequest]
+
+      // A send payment of 3 mBTC, more than asked but it should still be accepted
+      val sendReq = SendPayment(amountMsat.amount, pr.paymentHash, nodes("D").nodeParams.nodeId)
+      sender.send(nodes("A").paymentInitiator, sendReq)
+      sender.expectMsgType[PaymentSucceeded]
+    }
+  }
+
+  /**
+    * We currently use p2pkh script Helpers.getFinalScriptPubKey
+    *
+    * @param scriptPubKey
+    * @return
+    */
+  def scriptPubKeyToAddress(scriptPubKey: BinaryData) = Script.parse(scriptPubKey) match {
+    case OP_DUP :: OP_HASH160 :: OP_PUSHDATA(pubKeyHash, _) :: OP_EQUALVERIFY :: OP_CHECKSIG :: Nil =>
+      Base58Check.encode(Base58.Prefix.PubkeyAddressTestnet, pubKeyHash)
+    case OP_HASH160 :: OP_PUSHDATA(scriptHash, _) :: OP_EQUAL :: Nil =>
+      Base58Check.encode(Base58.Prefix.ScriptAddressTestnet, scriptHash)
+    case OP_0 :: OP_PUSHDATA(pubKeyHash, _) :: Nil if pubKeyHash.length == 20 => Bech32.encodeWitnessAddress("bcrt", 0, pubKeyHash)
+    case OP_0 :: OP_PUSHDATA(scriptHash, _) :: Nil if scriptHash.length == 32 => Bech32.encodeWitnessAddress("bcrt", 0, scriptHash)
+    case _ => ???
+  }
+
   test("propagate a fulfill upstream when a downstream htlc is redeemed on-chain (local commit)") {
     val sender = TestProbe()
+    // we subscribe to C's channel state transitions
+    val stateListener = TestProbe()
+    nodes("C").system.eventStream.subscribe(stateListener.ref, classOf[ChannelStateChanged])
     // first we make sure we are in sync with current blockchain height
     sender.send(bitcoincli, BitcoinReq("getblockcount"))
     val currentBlockCount = sender.expectMsgType[JValue](10 seconds).extract[Long]
     awaitCond(Globals.blockCount.get() == currentBlockCount, max = 20 seconds, interval = 1 second)
-    // we also retrieve transactions already received so that we don't take them into account when evaluating the outcome of this test
-    sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
-    val res = sender.expectMsgType[JValue](10 seconds)
-    val previouslyReceivedByC = res.filter(_ \ "address" == JString(finalAddresses("C"))).flatMap(_ \ "txids" \\ classOf[JString])
     // NB: F has a no-op payment handler, allowing us to manually fulfill htlcs
     val htlcReceiver = TestProbe()
     // we register this probe as the final payment handler
@@ -380,22 +408,32 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     val preimage: BinaryData = "42" * 32
     val paymentHash = Crypto.sha256(preimage)
     // A sends a payment to F
-    val paymentReq = SendPayment(100000000L, paymentHash, nodes("F1").nodeParams.privateKey.publicKey, maxAttempts = 1)
+    val paymentReq = SendPayment(100000000L, paymentHash, nodes("F1").nodeParams.nodeId, maxAttempts = 1)
     val paymentSender = TestProbe()
     paymentSender.send(nodes("A").paymentInitiator, paymentReq)
     // F gets the htlc
     val htlc = htlcReceiver.expectMsgType[UpdateAddHtlc]
+    // now that we have the channel id, we retrieve channels default final addresses
+    sender.send(nodes("C").register, Forward(htlc.channelId, CMD_GETSTATEDATA))
+    val finalAddressC = scriptPubKeyToAddress(sender.expectMsgType[DATA_NORMAL].commitments.localParams.defaultFinalScriptPubKey)
+    sender.send(nodes("F1").register, Forward(htlc.channelId, CMD_GETSTATEDATA))
+    val finalAddressF = scriptPubKeyToAddress(sender.expectMsgType[DATA_NORMAL].commitments.localParams.defaultFinalScriptPubKey)
+    // we also retrieve transactions already received so that we don't take them into account when evaluating the outcome of this test
+    sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
+    val res = sender.expectMsgType[JValue](10 seconds)
+    val previouslyReceivedByC = res.filter(_ \ "address" == JString(finalAddressC)).flatMap(_ \ "txids" \\ classOf[JString])
     // we then kill the connection between C and F
     sender.send(nodes("F1").switchboard, 'peers)
     val peers = sender.expectMsgType[Map[PublicKey, ActorRef]]
-    peers(nodes("C").nodeParams.privateKey.publicKey) ! Disconnect
+    peers(nodes("C").nodeParams.nodeId) ! Disconnect
     // we then wait for F to be in disconnected state
     awaitCond({
       sender.send(nodes("F1").register, Forward(htlc.channelId, CMD_GETSTATE))
       sender.expectMsgType[State] == OFFLINE
     }, max = 20 seconds, interval = 1 second)
     // we then have C unilateral close the channel (which will make F redeem the htlc onchain)
-    sender.send(nodes("C").register, Forward(htlc.channelId, INPUT_PUBLISH_LOCALCOMMIT))
+    sender.send(nodes("C").register, Forward(htlc.channelId, CMD_FORCECLOSE))
+    sender.expectMsg("ok")
     // we then wait for F to detect the unilateral close and go to CLOSING state
     awaitCond({
       sender.send(nodes("F1").register, Forward(htlc.channelId, CMD_GETSTATE))
@@ -412,7 +450,7 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     awaitCond({
       sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
       val res = sender.expectMsgType[JValue](10 seconds)
-      res.filter(_ \ "address" == JString(finalAddresses("F1"))).flatMap(_ \ "txids" \\ classOf[JString]).size == 1
+      res.filter(_ \ "address" == JString(finalAddressF)).flatMap(_ \ "txids" \\ classOf[JString]).size == 1
     }, max = 30 seconds, interval = 1 second)
     // we then generate enough blocks so that C gets its main delayed output
     sender.send(bitcoincli, BitcoinReq("generate", 145))
@@ -421,22 +459,26 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     awaitCond({
       sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
       val res = sender.expectMsgType[JValue](10 seconds)
-      val receivedByC = res.filter(_ \ "address" == JString(finalAddresses("C"))).flatMap(_ \ "txids" \\ classOf[JString])
+      val receivedByC = res.filter(_ \ "address" == JString(finalAddressC)).flatMap(_ \ "txids" \\ classOf[JString])
       (receivedByC diff previouslyReceivedByC).size == 1
     }, max = 30 seconds, interval = 1 second)
-    awaitAnnouncements(nodes.filter(_._1 == "A"), 8, 8, 16)
+    // we generate blocks to make tx confirm
+    sender.send(bitcoincli, BitcoinReq("generate", 2))
+    sender.expectMsgType[JValue](10 seconds)
+    // and we wait for C'channel to close
+    awaitCond(stateListener.expectMsgType[ChannelStateChanged].currentState == CLOSED, max = 30 seconds)
+    awaitAnnouncements(nodes.filter(_._1 == "A"), 8, 9, 20)
   }
 
   test("propagate a fulfill upstream when a downstream htlc is redeemed on-chain (remote commit)") {
     val sender = TestProbe()
+    // we subscribe to C's channel state transitions
+    val stateListener = TestProbe()
+    nodes("C").system.eventStream.subscribe(stateListener.ref, classOf[ChannelStateChanged])
     // first we make sure we are in sync with current blockchain height
     sender.send(bitcoincli, BitcoinReq("getblockcount"))
     val currentBlockCount = sender.expectMsgType[JValue](10 seconds).extract[Long]
     awaitCond(Globals.blockCount.get() == currentBlockCount, max = 20 seconds, interval = 1 second)
-    // we also retrieve transactions already received so that we don't take them into account when evaluating the outcome of this test
-    sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
-    val res = sender.expectMsgType[JValue](10 seconds)
-    val previouslyReceivedByC = res.filter(_ \ "address" == JString(finalAddresses("C"))).flatMap(_ \ "txids" \\ classOf[JString])
     // NB: F has a no-op payment handler, allowing us to manually fulfill htlcs
     val htlcReceiver = TestProbe()
     // we register this probe as the final payment handler
@@ -444,22 +486,32 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     val preimage: BinaryData = "42" * 32
     val paymentHash = Crypto.sha256(preimage)
     // A sends a payment to F
-    val paymentReq = SendPayment(100000000L, paymentHash, nodes("F2").nodeParams.privateKey.publicKey, maxAttempts = 1)
+    val paymentReq = SendPayment(100000000L, paymentHash, nodes("F2").nodeParams.nodeId, maxAttempts = 1)
     val paymentSender = TestProbe()
     paymentSender.send(nodes("A").paymentInitiator, paymentReq)
     // F gets the htlc
     val htlc = htlcReceiver.expectMsgType[UpdateAddHtlc]
+    // now that we have the channel id, we retrieve channels default final addresses
+    sender.send(nodes("C").register, Forward(htlc.channelId, CMD_GETSTATEDATA))
+    val finalAddressC = scriptPubKeyToAddress(sender.expectMsgType[DATA_NORMAL].commitments.localParams.defaultFinalScriptPubKey)
+    sender.send(nodes("F2").register, Forward(htlc.channelId, CMD_GETSTATEDATA))
+    val finalAddressF = scriptPubKeyToAddress(sender.expectMsgType[DATA_NORMAL].commitments.localParams.defaultFinalScriptPubKey)
+    // we also retrieve transactions already received so that we don't take them into account when evaluating the outcome of this test
+    sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
+    val res = sender.expectMsgType[JValue](10 seconds)
+    val previouslyReceivedByC = res.filter(_ \ "address" == JString(finalAddressC)).flatMap(_ \ "txids" \\ classOf[JString])
     // we then kill the connection between C and F
     sender.send(nodes("F2").switchboard, 'peers)
     val peers = sender.expectMsgType[Map[PublicKey, ActorRef]]
-    peers(nodes("C").nodeParams.privateKey.publicKey) ! Disconnect
+    peers(nodes("C").nodeParams.nodeId) ! Disconnect
     // we then wait for F to be in disconnected state
     awaitCond({
       sender.send(nodes("F2").register, Forward(htlc.channelId, CMD_GETSTATE))
       sender.expectMsgType[State] == OFFLINE
     }, max = 20 seconds, interval = 1 second)
     // then we have F unilateral close the channel
-    sender.send(nodes("F2").register, Forward(htlc.channelId, INPUT_PUBLISH_LOCALCOMMIT))
+    sender.send(nodes("F2").register, Forward(htlc.channelId, CMD_FORCECLOSE))
+    sender.expectMsg("ok")
     // we then fulfill the htlc (it won't be sent to C, and will be used to pull funds on-chain)
     sender.send(nodes("F2").register, Forward(htlc.channelId, CMD_FULFILL_HTLC(htlc.id, preimage)))
     // we then generate one block so that the htlc success tx gets written to the blockchain
@@ -475,28 +527,32 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     awaitCond({
       sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
       val res = sender.expectMsgType[JValue](10 seconds)
-      res.filter(_ \ "address" == JString(finalAddresses("F2"))).flatMap(_ \ "txids" \\ classOf[JString]).size == 1
+      res.filter(_ \ "address" == JString(finalAddressF)).flatMap(_ \ "txids" \\ classOf[JString]).size == 1
     }, max = 30 seconds, interval = 1 second)
     // and C will have its main output
     awaitCond({
       sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
       val res = sender.expectMsgType[JValue](10 seconds)
-      val receivedByC = res.filter(_ \ "address" == JString(finalAddresses("C"))).flatMap(_ \ "txids" \\ classOf[JString])
+      val receivedByC = res.filter(_ \ "address" == JString(finalAddressC)).flatMap(_ \ "txids" \\ classOf[JString])
       (receivedByC diff previouslyReceivedByC).size == 1
     }, max = 30 seconds, interval = 1 second)
-    awaitAnnouncements(nodes.filter(_._1 == "A"), 7, 7, 14)
+    // we generate blocks to make tx confirm
+    sender.send(bitcoincli, BitcoinReq("generate", 2))
+    sender.expectMsgType[JValue](10 seconds)
+    // and we wait for C'channel to close
+    awaitCond(stateListener.expectMsgType[ChannelStateChanged].currentState == CLOSED, max = 30 seconds)
+    awaitAnnouncements(nodes.filter(_._1 == "A"), 7, 8, 18)
   }
 
   test("propagate a failure upstream when a downstream htlc times out (local commit)") {
     val sender = TestProbe()
+    // we subscribe to C's channel state transitions
+    val stateListener = TestProbe()
+    nodes("C").system.eventStream.subscribe(stateListener.ref, classOf[ChannelStateChanged])
     // first we make sure we are in sync with current blockchain height
     sender.send(bitcoincli, BitcoinReq("getblockcount"))
     val currentBlockCount = sender.expectMsgType[JValue](10 seconds).extract[Long]
     awaitCond(Globals.blockCount.get() == currentBlockCount, max = 20 seconds, interval = 1 second)
-    // we also retrieve transactions already received so that we don't take them into account when evaluating the outcome of this test
-    sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
-    val res = sender.expectMsgType[JValue](10 seconds)
-    val previouslyReceivedByC = res.filter(_ \ "address" == JString(finalAddresses("C"))).flatMap(_ \ "txids" \\ classOf[JString])
     // NB: F has a no-op payment handler, allowing us to manually fulfill htlcs
     val htlcReceiver = TestProbe()
     // we register this probe as the final payment handler
@@ -504,19 +560,32 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     val preimage: BinaryData = "42" * 32
     val paymentHash = Crypto.sha256(preimage)
     // A sends a payment to F
-    val paymentReq = SendPayment(100000000L, paymentHash, nodes("F3").nodeParams.privateKey.publicKey, maxAttempts = 1)
+    val paymentReq = SendPayment(100000000L, paymentHash, nodes("F3").nodeParams.nodeId, maxAttempts = 1)
     val paymentSender = TestProbe()
     paymentSender.send(nodes("A").paymentInitiator, paymentReq)
     // F gets the htlc
     val htlc = htlcReceiver.expectMsgType[UpdateAddHtlc]
+    // now that we have the channel id, we retrieve channels default final addresses
+    sender.send(nodes("C").register, Forward(htlc.channelId, CMD_GETSTATEDATA))
+    val finalAddressC = scriptPubKeyToAddress(sender.expectMsgType[DATA_NORMAL].commitments.localParams.defaultFinalScriptPubKey)
+    // we also retrieve transactions already received so that we don't take them into account when evaluating the outcome of this test
+    sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
+    val res = sender.expectMsgType[JValue](10 seconds)
+    val previouslyReceivedByC = res.filter(_ \ "address" == JString(finalAddressC)).flatMap(_ \ "txids" \\ classOf[JString])
     // we then generate enough blocks to make the htlc timeout
     sender.send(bitcoincli, BitcoinReq("generate", 11))
     sender.expectMsgType[JValue](10 seconds)
+    // we generate more blocks for the htlc-timeout to reach enough confirmations
+    awaitCond({
+      sender.send(bitcoincli, BitcoinReq("generate", 1))
+      sender.expectMsgType[JValue](10 seconds)
+      paymentSender.msgAvailable
+    }, max = 30 seconds, interval = 1 second)
     // this will fail the htlc
     val failed = paymentSender.expectMsgType[PaymentFailed](30 seconds)
     assert(failed.paymentHash === paymentHash)
     assert(failed.failures.size === 1)
-    assert(failed.failures.head.asInstanceOf[RemoteFailure].e === ErrorPacket(nodes("C").nodeParams.privateKey.publicKey, PermanentChannelFailure))
+    assert(failed.failures.head.asInstanceOf[RemoteFailure].e === ErrorPacket(nodes("C").nodeParams.nodeId, PermanentChannelFailure))
     // we then generate enough blocks to confirm all delayed transactions
     sender.send(bitcoincli, BitcoinReq("generate", 150))
     sender.expectMsgType[JValue](10 seconds)
@@ -524,22 +593,26 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     awaitCond({
       sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
       val res = sender.expectMsgType[JValue](10 seconds)
-      val receivedByC = res.filter(_ \ "address" == JString(finalAddresses("C"))).flatMap(_ \ "txids" \\ classOf[JString])
+      val receivedByC = res.filter(_ \ "address" == JString(finalAddressC)).flatMap(_ \ "txids" \\ classOf[JString])
       (receivedByC diff previouslyReceivedByC).size == 2
     }, max = 30 seconds, interval = 1 second)
-    awaitAnnouncements(nodes.filter(_._1 == "A"), 6, 6, 12)
+    // we generate blocks to make tx confirm
+    sender.send(bitcoincli, BitcoinReq("generate", 2))
+    sender.expectMsgType[JValue](10 seconds)
+    // and we wait for C'channel to close
+    awaitCond(stateListener.expectMsgType[ChannelStateChanged].currentState == CLOSED, max = 30 seconds)
+    awaitAnnouncements(nodes.filter(_._1 == "A"), 6, 7, 16)
   }
 
   test("propagate a failure upstream when a downstream htlc times out (remote commit)") {
     val sender = TestProbe()
+    // we subscribe to C's channel state transitions
+    val stateListener = TestProbe()
+    nodes("C").system.eventStream.subscribe(stateListener.ref, classOf[ChannelStateChanged])
     // first we make sure we are in sync with current blockchain height
     sender.send(bitcoincli, BitcoinReq("getblockcount"))
     val currentBlockCount = sender.expectMsgType[JValue](10 seconds).extract[Long]
     awaitCond(Globals.blockCount.get() == currentBlockCount, max = 20 seconds, interval = 1 second)
-    // we also retrieve transactions already received so that we don't take them into account when evaluating the outcome of this test
-    sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
-    val res = sender.expectMsgType[JValue](10 seconds)
-    val previouslyReceivedByC = res.filter(_ \ "address" == JString(finalAddresses("C"))).flatMap(_ \ "txids" \\ classOf[JString])
     // NB: F has a no-op payment handler, allowing us to manually fulfill htlcs
     val htlcReceiver = TestProbe()
     // we register this probe as the final payment handler
@@ -547,21 +620,35 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     val preimage: BinaryData = "42" * 32
     val paymentHash = Crypto.sha256(preimage)
     // A sends a payment to F
-    val paymentReq = SendPayment(100000000L, paymentHash, nodes("F4").nodeParams.privateKey.publicKey, maxAttempts = 1)
+    val paymentReq = SendPayment(100000000L, paymentHash, nodes("F4").nodeParams.nodeId, maxAttempts = 1)
     val paymentSender = TestProbe()
     paymentSender.send(nodes("A").paymentInitiator, paymentReq)
     // F gets the htlc
     val htlc = htlcReceiver.expectMsgType[UpdateAddHtlc]
+    // now that we have the channel id, we retrieve channels default final addresses
+    sender.send(nodes("C").register, Forward(htlc.channelId, CMD_GETSTATEDATA))
+    val finalAddressC = scriptPubKeyToAddress(sender.expectMsgType[DATA_NORMAL].commitments.localParams.defaultFinalScriptPubKey)
+    // we also retrieve transactions already received so that we don't take them into account when evaluating the outcome of this test
+    sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
+    val res = sender.expectMsgType[JValue](10 seconds)
+    val previouslyReceivedByC = res.filter(_ \ "address" == JString(finalAddressC)).flatMap(_ \ "txids" \\ classOf[JString])
     // then we ask F to unilaterally close the channel
-    sender.send(nodes("F4").register, Forward(htlc.channelId, INPUT_PUBLISH_LOCALCOMMIT))
+    sender.send(nodes("F4").register, Forward(htlc.channelId, CMD_FORCECLOSE))
+    sender.expectMsg("ok")
     // we then generate enough blocks to make the htlc timeout
     sender.send(bitcoincli, BitcoinReq("generate", 11))
     sender.expectMsgType[JValue](10 seconds)
+    // we generate more blocks for the claim-htlc-timeout to reach enough confirmations
+    awaitCond({
+      sender.send(bitcoincli, BitcoinReq("generate", 1))
+      sender.expectMsgType[JValue](10 seconds)
+      paymentSender.msgAvailable
+    }, max = 30 seconds, interval = 1 second)
     // this will fail the htlc
     val failed = paymentSender.expectMsgType[PaymentFailed](30 seconds)
     assert(failed.paymentHash === paymentHash)
     assert(failed.failures.size === 1)
-    assert(failed.failures.head.asInstanceOf[RemoteFailure].e === ErrorPacket(nodes("C").nodeParams.privateKey.publicKey, PermanentChannelFailure))
+    assert(failed.failures.head.asInstanceOf[RemoteFailure].e === ErrorPacket(nodes("C").nodeParams.nodeId, PermanentChannelFailure))
     // we then generate enough blocks to confirm all delayed transactions
     sender.send(bitcoincli, BitcoinReq("generate", 145))
     sender.expectMsgType[JValue](10 seconds)
@@ -569,10 +656,137 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     awaitCond({
       sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
       val res = sender.expectMsgType[JValue](10 seconds)
-      val receivedByC = res.filter(_ \ "address" == JString(finalAddresses("C"))).flatMap(_ \ "txids" \\ classOf[JString])
+      val receivedByC = res.filter(_ \ "address" == JString(finalAddressC)).flatMap(_ \ "txids" \\ classOf[JString])
       (receivedByC diff previouslyReceivedByC).size == 2
     }, max = 30 seconds, interval = 1 second)
-    awaitAnnouncements(nodes.filter(_._1 == "A"), 5, 5, 10)
+    // we generate blocks to make tx confirm
+    sender.send(bitcoincli, BitcoinReq("generate", 2))
+    sender.expectMsgType[JValue](10 seconds)
+    // and we wait for C'channel to close
+    awaitCond(stateListener.expectMsgType[ChannelStateChanged].currentState == CLOSED, max = 30 seconds)
+    awaitAnnouncements(nodes.filter(_._1 == "A"), 5, 6, 14)
+  }
+
+  test("punish a node that has published a revoked commit tx") {
+    val sender = TestProbe()
+    // we subscribe to C's channel state transitions
+    val stateListener = TestProbe()
+    nodes("C").system.eventStream.subscribe(stateListener.ref, classOf[ChannelStateChanged])
+    // we use this to get commitments
+    val sigListener = TestProbe()
+    nodes("F5").system.eventStream.subscribe(sigListener.ref, classOf[ChannelSignatureReceived])
+    // we use this to control when to fulfill htlcs, setup is as follow : noop-handler ---> forward-handler ---> payment-handler
+    val forwardHandlerC = TestProbe()
+    nodes("C").paymentHandler ! forwardHandlerC.ref
+    val forwardHandlerF = TestProbe()
+    nodes("F5").paymentHandler ! forwardHandlerF.ref
+    // this is the actual payment handler that we will forward requests to
+    val paymentHandlerC = nodes("C").system.actorOf(LocalPaymentHandler.props(nodes("C").nodeParams))
+    val paymentHandlerF = nodes("F5").system.actorOf(LocalPaymentHandler.props(nodes("F5").nodeParams))
+    // first we make sure we are in sync with current blockchain height
+    sender.send(bitcoincli, BitcoinReq("getblockcount"))
+    val currentBlockCount = sender.expectMsgType[JValue](10 seconds).extract[Long]
+    awaitCond(Globals.blockCount.get() == currentBlockCount, max = 20 seconds, interval = 1 second)
+    // first we send 3 mBTC to F so that it has a balance
+    val amountMsat = MilliSatoshi(300000000L)
+    sender.send(paymentHandlerF, ReceivePayment(Some(amountMsat), "1 coffee"))
+    val pr = sender.expectMsgType[PaymentRequest]
+    val sendReq = SendPayment(300000000L, pr.paymentHash, pr.nodeId)
+    sender.send(nodes("A").paymentInitiator, sendReq)
+    // we forward the htlc to the payment handler
+    forwardHandlerF.expectMsgType[UpdateAddHtlc]
+    forwardHandlerF.forward(paymentHandlerF)
+    sigListener.expectMsgType[ChannelSignatureReceived]
+    sigListener.expectMsgType[ChannelSignatureReceived]
+    sender.expectMsgType[PaymentSucceeded]
+    // we now send a few htlcs C->F and F->C in order to obtain a commitments with multiple htlcs
+    def send(amountMsat: Long, paymentHandler: ActorRef, paymentInitiator: ActorRef) = {
+      sender.send(paymentHandler, ReceivePayment(Some(MilliSatoshi(amountMsat)), "1 coffee"))
+      val pr = sender.expectMsgType[PaymentRequest]
+      val sendReq = SendPayment(amountMsat, pr.paymentHash, pr.nodeId)
+      sender.send(paymentInitiator, sendReq)
+    }
+    val buffer = TestProbe()
+    send(100000000, paymentHandlerF, nodes("C").paymentInitiator) // will be left pending
+    forwardHandlerF.expectMsgType[UpdateAddHtlc]
+    forwardHandlerF.forward(buffer.ref)
+    sigListener.expectMsgType[ChannelSignatureReceived]
+    send(110000000, paymentHandlerF, nodes("C").paymentInitiator) // will be left pending
+    forwardHandlerF.expectMsgType[UpdateAddHtlc]
+    forwardHandlerF.forward(buffer.ref)
+    sigListener.expectMsgType[ChannelSignatureReceived]
+    send(120000000, paymentHandlerC, nodes("F5").paymentInitiator)
+    forwardHandlerC.expectMsgType[UpdateAddHtlc]
+    forwardHandlerC.forward(buffer.ref)
+    sigListener.expectMsgType[ChannelSignatureReceived]
+    send(130000000, paymentHandlerC, nodes("F5").paymentInitiator)
+    forwardHandlerC.expectMsgType[UpdateAddHtlc]
+    forwardHandlerC.forward(buffer.ref)
+    val commitmentsF = sigListener.expectMsgType[ChannelSignatureReceived].commitments
+    sigListener.expectNoMsg(1 second)
+    // in this commitment, both parties should have a main output, and there are four pending htlcs
+    val localCommitF = commitmentsF.localCommit.publishableTxs
+    assert(localCommitF.commitTx.tx.txOut.size === 6)
+    val htlcTimeoutTxs = localCommitF.htlcTxsAndSigs.collect { case h@HtlcTxAndSigs(_: HtlcTimeoutTx, _, _) => h }
+    val htlcSuccessTxs = localCommitF.htlcTxsAndSigs.collect { case h@HtlcTxAndSigs(_: HtlcSuccessTx, _, _) => h }
+    assert(htlcTimeoutTxs.size === 2)
+    assert(htlcSuccessTxs.size === 2)
+    // we fulfill htlcs to get the preimagse
+    buffer.expectMsgType[UpdateAddHtlc]
+    buffer.forward(paymentHandlerF)
+    sigListener.expectMsgType[ChannelSignatureReceived]
+    val preimage1 = sender.expectMsgType[PaymentSucceeded].paymentPreimage
+    buffer.expectMsgType[UpdateAddHtlc]
+    buffer.forward(paymentHandlerF)
+    sigListener.expectMsgType[ChannelSignatureReceived]
+    sender.expectMsgType[PaymentSucceeded].paymentPreimage
+    buffer.expectMsgType[UpdateAddHtlc]
+    buffer.forward(paymentHandlerC)
+    sigListener.expectMsgType[ChannelSignatureReceived]
+    sender.expectMsgType[PaymentSucceeded].paymentPreimage
+    buffer.expectMsgType[UpdateAddHtlc]
+    buffer.forward(paymentHandlerC)
+    sigListener.expectMsgType[ChannelSignatureReceived]
+    sender.expectMsgType[PaymentSucceeded].paymentPreimage
+    // this also allows us to get the channel id
+    val channelId = commitmentsF.channelId
+    // we also retrieve C's default final address
+    sender.send(nodes("C").register, Forward(channelId, CMD_GETSTATEDATA))
+    val finalAddressC = scriptPubKeyToAddress(sender.expectMsgType[DATA_NORMAL].commitments.localParams.defaultFinalScriptPubKey)
+    // and we retrieve transactions already received so that we don't take them into account when evaluating the outcome of this test
+    sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
+    val res = sender.expectMsgType[JValue](10 seconds)
+    val previouslyReceivedByC = res.filter(_ \ "address" == JString(finalAddressC)).flatMap(_ \ "txids" \\ classOf[JString])
+    // F will publish the commitment above, which is now revoked
+    val revokedCommitTx = localCommitF.commitTx.tx
+    val htlcSuccess = Transactions.addSigs(htlcSuccessTxs.head.txinfo.asInstanceOf[HtlcSuccessTx], htlcSuccessTxs.head.localSig, htlcSuccessTxs.head.remoteSig, preimage1).tx
+    val htlcTimeout = Transactions.addSigs(htlcTimeoutTxs.head.txinfo.asInstanceOf[HtlcTimeoutTx], htlcTimeoutTxs.head.localSig, htlcTimeoutTxs.head.remoteSig).tx
+    Transaction.correctlySpends(htlcSuccess, Seq(revokedCommitTx), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+    Transaction.correctlySpends(htlcTimeout, Seq(revokedCommitTx), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+    // we then generate blocks to make the htlc timeout (nothing will happen in the channel because all of them have already been fulfilled)
+    sender.send(bitcoincli, BitcoinReq("generate", 20))
+    sender.expectMsgType[JValue](10 seconds)
+    // then we publish F's revoked transactions
+    sender.send(bitcoincli, BitcoinReq("sendrawtransaction", revokedCommitTx.toString()))
+    sender.expectMsgType[JValue](10000 seconds)
+    sender.send(bitcoincli, BitcoinReq("sendrawtransaction", htlcSuccess.toString()))
+    sender.expectMsgType[JValue](10000 seconds)
+    sender.send(bitcoincli, BitcoinReq("sendrawtransaction", htlcTimeout.toString()))
+    sender.expectMsgType[JValue](10000 seconds)
+    // at this point C should have 3 recv transactions: its previous main output, and F's main and htlc output (taken as punishment)
+    awaitCond({
+      sender.send(bitcoincli, BitcoinReq("listreceivedbyaddress", 0))
+      val res = sender.expectMsgType[JValue](10 seconds)
+      val receivedByC = res.filter(_ \ "address" == JString(finalAddressC)).flatMap(_ \ "txids" \\ classOf[JString])
+      (receivedByC diff previouslyReceivedByC).size == 6
+    }, max = 30 seconds, interval = 1 second)
+    // we generate blocks to make tx confirm
+    sender.send(bitcoincli, BitcoinReq("generate", 2))
+    sender.expectMsgType[JValue](10 seconds)
+    // and we wait for C'channel to close
+    awaitCond(stateListener.expectMsgType[ChannelStateChanged].currentState == CLOSED, max = 30 seconds)
+    // this will remove the channel
+    awaitAnnouncements(nodes.filter(_._1 == "A"), 4, 5, 12)
   }
 
   test("generate and validate lots of channels") {
@@ -594,6 +808,9 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with FunSuiteLike wit
     // then we make the announcements
     val announcements = channels.map(c => AnnouncementsBatchValidationSpec.makeChannelAnnouncement(c))
     announcements.foreach(ann => nodes("A").router ! ann)
+    // we need to send channel_update otherwise router won't validate the channels
+    val updates = channels.zip(announcements).map(x => AnnouncementsBatchValidationSpec.makeChannelUpdate(x._1, x._2.shortChannelId))
+    updates.foreach(update => nodes("A").router ! update)
     awaitCond({
       sender.send(nodes("D").router, 'channels)
       sender.expectMsgType[Iterable[ChannelAnnouncement]](5 seconds).size == channels.size + 5 // 5 remaining channels because  D->F{1-F4} have disappeared

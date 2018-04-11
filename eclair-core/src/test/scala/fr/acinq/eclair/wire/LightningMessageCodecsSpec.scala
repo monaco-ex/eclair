@@ -1,12 +1,28 @@
+/*
+ * Copyright 2018 ACINQ SAS
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package fr.acinq.eclair.wire
 
 import java.net.{InetAddress, InetSocketAddress}
 
 import fr.acinq.bitcoin.Crypto.{PrivateKey, Scalar}
-import fr.acinq.bitcoin.{BinaryData, Crypto}
+import fr.acinq.bitcoin.{BinaryData, Block, Crypto}
 import fr.acinq.eclair.crypto.Sphinx
-import fr.acinq.eclair.{UInt64, randomBytes, randomKey}
-import fr.acinq.eclair.wire.LightningMessageCodecs.{lightningMessageCodec, rgb, socketaddress, uint64ex, zeropaddedstring}
+import fr.acinq.eclair.wire.LightningMessageCodecs._
+import fr.acinq.eclair.{ShortChannelId, UInt64, randomBytes, randomKey}
 import org.junit.runner.RunWith
 import org.scalatest.FunSuite
 import org.scalatest.junit.JUnitRunner
@@ -17,6 +33,7 @@ import scodec.bits.{BitVector, HexStringSyntax}
   */
 @RunWith(classOf[JUnitRunner])
 class LightningMessageCodecsSpec extends FunSuite {
+  import LightningMessageCodecsSpec._
 
   def bin(size: Int, fill: Byte): BinaryData = Array.fill[Byte](size)(fill)
 
@@ -26,41 +43,22 @@ class LightningMessageCodecsSpec extends FunSuite {
 
   def publicKey(fill: Byte) = PrivateKey(bin(32, fill), compressed = true).publicKey
 
-  def randomSignature: BinaryData = {
-    val priv = randomBytes(32)
-    val data = randomBytes(32)
-    val (r, s) = Crypto.sign(data, PrivateKey(priv, true))
-    Crypto.encodeSignature(r, s) :+ fr.acinq.bitcoin.SIGHASH_ALL.toByte
-  }
-
   test("encode/decode with uint64 codec") {
     val expected = Map(
-      UInt64(0) -> hex"00 00 00 00 00 00 00 00".toBitVector,
-      UInt64(42) -> hex"00 00 00 00 00 00 00 2a".toBitVector,
-      UInt64("0xffffffffffffffff") -> hex"ff ff ff ff ff ff ff ff".toBitVector
-    )
+      UInt64(0) -> hex"00 00 00 00 00 00 00 00",
+      UInt64(42) -> hex"00 00 00 00 00 00 00 2a",
+      UInt64("0xffffffffffffffff") -> hex"ff ff ff ff ff ff ff ff"
+    ).mapValues(_.toBitVector)
     for ((uint, ref) <- expected) {
-      val bin = uint64ex.encode(uint).require
-      assert(bin === ref)
-      val uint2 = uint64ex.decode(bin).require.value
-      assert(uint === uint2)
+      val encoded = uint64ex.encode(uint).require
+      assert(ref === encoded)
+      val decoded = uint64ex.decode(encoded).require.value
+      assert(uint === decoded)
     }
   }
 
-  test("encode/decode values greater than 2^63-1 with uint64 codec") {
-    /*val a = UInt64("0xffffffffffffffff")
-    val b = UInt64("0xfffffffffffffffe")
-    assert(a > b)
-    assert(b < a)
-    assert(a == a)
-    assert(a.toBin === BinaryData("0xffffffffffffffff"))
-    assert(a.toString === "UInt64(18446744073709551615)")
-    assert(b.toBin === BinaryData("0xfffffffffffffffe"))
-    assert(b.toString === "UInt64(18446744073709551614)")*/
-  }
-
   test("encode/decode with rgb codec") {
-    val color = (47.toByte, 255.toByte, 142.toByte)
+    val color = Color(47.toByte, 255.toByte, 142.toByte)
     val bin = rgb.encode(color).require
     assert(bin === hex"2f ff 8e".toBitVector)
     val color2 = rgb.decode(bin).require.value
@@ -169,8 +167,8 @@ class LightningMessageCodecsSpec extends FunSuite {
 
   test("encode/decode all channel messages") {
 
-    val open = OpenChannel(randomBytes(32), randomBytes(32), 3, 4, 5, UInt64(6), 7, 8, 9, 10, 11, publicKey(1), point(2), point(3), point(4), point(5), 0.toByte)
-    val accept = AcceptChannel(randomBytes(32), 3, UInt64(4), 5, 6, 7, 8, 9, publicKey(1), point(2), point(3), point(4), point(5))
+    val open = OpenChannel(randomBytes(32), randomBytes(32), 3, 4, 5, UInt64(6), 7, 8, 9, 10, 11, publicKey(1), point(2), point(3), point(4), point(5), point(6), 0.toByte)
+    val accept = AcceptChannel(randomBytes(32), 3, UInt64(4), 5, 6, 7, 8, 9, publicKey(1), point(2), point(3), point(4), point(5), point(6))
     val funding_created = FundingCreated(randomBytes(32), bin(32, 0), 3, randomSignature)
     val funding_signed = FundingSigned(randomBytes(32), randomSignature)
     val funding_locked = FundingLocked(randomBytes(32), point(2))
@@ -183,10 +181,10 @@ class LightningMessageCodecsSpec extends FunSuite {
     val update_fail_malformed_htlc = UpdateFailMalformedHtlc(randomBytes(32), 2, randomBytes(32), 1111)
     val commit_sig = CommitSig(randomBytes(32), randomSignature, randomSignature :: randomSignature :: randomSignature :: Nil)
     val revoke_and_ack = RevokeAndAck(randomBytes(32), scalar(0), point(1))
-    val channel_announcement = ChannelAnnouncement(randomSignature, randomSignature, randomSignature, randomSignature, 1, randomKey.publicKey, randomKey.publicKey, randomKey.publicKey, randomKey.publicKey, bin(7, 9))
-    val node_announcement = NodeAnnouncement(randomSignature, 1, randomKey.publicKey, (100.toByte, 200.toByte, 300.toByte), "node-alias", bin(0, 0), new InetSocketAddress(InetAddress.getByAddress(Array[Byte](192.toByte, 168.toByte, 1.toByte, 42.toByte)), 42000) :: Nil)
-    val channel_update = ChannelUpdate(randomSignature, 1, 2, bin(2, 2), 3, 4, 5, 6)
-    val announcement_signatures = AnnouncementSignatures(randomBytes(32), 42, randomSignature, randomSignature)
+    val channel_announcement = ChannelAnnouncement(randomSignature, randomSignature, randomSignature, randomSignature, bin(7, 9), Block.RegtestGenesisBlock.hash, ShortChannelId(1), randomKey.publicKey, randomKey.publicKey, randomKey.publicKey, randomKey.publicKey)
+    val node_announcement = NodeAnnouncement(randomSignature, bin(0, 0), 1, randomKey.publicKey, Color(100.toByte, 200.toByte, 300.toByte), "node-alias", new InetSocketAddress(InetAddress.getByAddress(Array[Byte](192.toByte, 168.toByte, 1.toByte, 42.toByte)), 42000) :: Nil)
+    val channel_update = ChannelUpdate(randomSignature, Block.RegtestGenesisBlock.hash, ShortChannelId(1), 2, bin(2, 2), 3, 4, 5, 6)
+    val announcement_signatures = AnnouncementSignatures(randomBytes(32), ShortChannelId(42), randomSignature, randomSignature)
     val ping = Ping(100, BinaryData("01" * 10))
     val pong = Pong(BinaryData("01" * 10))
     val channel_reestablish = ChannelReestablish(randomBytes(32), 242842L, 42L)
@@ -206,7 +204,7 @@ class LightningMessageCodecsSpec extends FunSuite {
   }
 
   test("encode/decode per-hop payload") {
-    val payload = PerHopPayload(channel_id = 42, amtToForward = 142000, outgoingCltvValue = 500000)
+    val payload = PerHopPayload(channel_id = ShortChannelId(42), amtToForward = 142000, outgoingCltvValue = 500000)
     val bin = LightningMessageCodecs.perHopPayloadCodec.encode(payload).require
     assert(bin.toByteVector.size === 33)
     val payload1 = LightningMessageCodecs.perHopPayloadCodec.decode(bin).require.value
@@ -218,5 +216,14 @@ class LightningMessageCodecsSpec extends FunSuite {
       val payload2 = LightningMessageCodecs.perHopPayloadCodec.decode(bin1.toBitVector).require.value
       assert(payload2 === payload1)
     }
+  }
+}
+
+object LightningMessageCodecsSpec {
+  def randomSignature: BinaryData = {
+    val priv = randomBytes(32)
+    val data = randomBytes(32)
+    val (r, s) = Crypto.sign(data, PrivateKey(priv, true))
+    Crypto.encodeSignature(r, s) :+ fr.acinq.bitcoin.SIGHASH_ALL.toByte
   }
 }

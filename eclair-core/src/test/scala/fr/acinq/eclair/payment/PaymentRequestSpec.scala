@@ -1,8 +1,27 @@
+/*
+ * Copyright 2018 ACINQ SAS
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package fr.acinq.eclair.payment
 
+import java.nio.ByteOrder
+
 import fr.acinq.bitcoin.Crypto.{PrivateKey, PublicKey}
-import fr.acinq.bitcoin.{BinaryData, Btc, Crypto, MilliBtc, MilliSatoshi, Satoshi}
-import fr.acinq.eclair.payment.PaymentRequest.{Amount, RoutingInfoTag}
+import fr.acinq.bitcoin.{Bech32, BinaryData, Block, Btc, Crypto, MilliBtc, MilliSatoshi, Protocol, Satoshi}
+import fr.acinq.eclair.ShortChannelId
+import fr.acinq.eclair.payment.PaymentRequest._
 import org.junit.runner.RunWith
 import org.scalatest.FunSuite
 import org.scalatest.junit.JUnitRunner
@@ -94,20 +113,25 @@ class PaymentRequestSpec extends FunSuite {
     assert(PaymentRequest.write(pr.sign(priv)) == ref)
   }
 
-  test("On mainnet, with fallback address 1RustyRX2oai4EYYDpQGWvEL62BBGqN9T with extra routing info to get to node 029e03a901b85534ff1e92c43c74431f7ce72046060fcf7a95c37e148f78c77255") {
-    val ref = "lnbc20m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqsfpp3qjmp7lwpagxun9pygexvgpjdc4jdj85frzjq20q82gphp2nflc7jtzrcazrra7wwgzxqc8u7754cdlpfrmccae92qgzqvzq2ps8pqqqqqqqqqqqq9qqqvncsk57n4v9ehw86wq8fzvjejhv9z3w3q5zh6qkql005x9xl240ch23jk79ujzvr4hsmmafyxghpqe79psktnjl668ntaf4ne7ucs5csqh5mnnk"
+  test("On mainnet, with fallback address 1RustyRX2oai4EYYDpQGWvEL62BBGqN9T with extra routing info to go via nodes 029e03a901b85534ff1e92c43c74431f7ce72046060fcf7a95c37e148f78c77255 then 039e03a901b85534ff1e92c43c74431f7ce72046060fcf7a95c37e148f78c77255") {
+    val ref = "lnbc20m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqsfpp3qjmp7lwpagxun9pygexvgpjdc4jdj85fr9yq20q82gphp2nflc7jtzrcazrra7wwgzxqc8u7754cdlpfrmccae92qgzqvzq2ps8pqqqqqqpqqqqq9qqqvpeuqafqxu92d8lr6fvg0r5gv0heeeqgcrqlnm6jhphu9y00rrhy4grqszsvpcgpy9qqqqqqgqqqqq7qqzqj9n4evl6mr5aj9f58zp6fyjzup6ywn3x6sk8akg5v4tgn2q8g4fhx05wf6juaxu9760yp46454gpg5mtzgerlzezqcqvjnhjh8z3g2qqdhhwkj"
     val pr = PaymentRequest.read(ref)
     assert(pr.prefix == "lnbc")
-    assert(pr.amount == Some(MilliSatoshi(2000000000L)))
+    assert(pr.amount === Some(MilliSatoshi(2000000000L)))
     assert(pr.paymentHash == BinaryData("0001020304050607080900010203040506070809000102030405060708090102"))
     assert(pr.timestamp == 1496314658L)
     assert(pr.nodeId == PublicKey(BinaryData("03e7156ae33b0a208d0744199163177e909e80176e55d97a2f221ede0f934dd9ad")))
     assert(pr.description == Right(Crypto.sha256("One piece of chocolate cake, one icecream cone, one pickle, one slice of swiss cheese, one slice of salami, one lollypop, one piece of cherry pie, one sausage, one cupcake, and one slice of watermelon".getBytes)))
     assert(pr.fallbackAddress === Some("1RustyRX2oai4EYYDpQGWvEL62BBGqN9T"))
-    assert(pr.routingInfo() === RoutingInfoTag(PublicKey("029e03a901b85534ff1e92c43c74431f7ce72046060fcf7a95c37e148f78c77255"), "0102030405060708", 20, 3) :: Nil)
+    assert(pr.routingInfo === List(List(
+      ExtraHop(PublicKey("029e03a901b85534ff1e92c43c74431f7ce72046060fcf7a95c37e148f78c77255"), ShortChannelId(72623859790382856L), 1, 20, 3),
+      ExtraHop(PublicKey("039e03a901b85534ff1e92c43c74431f7ce72046060fcf7a95c37e148f78c77255"), ShortChannelId(217304205466536202L), 2, 30, 4)
+    )))
+    assert(BinaryData(Protocol.writeUInt64(0x0102030405060708L, ByteOrder.BIG_ENDIAN)) == BinaryData("0102030405060708"))
+    assert(BinaryData(Protocol.writeUInt64(0x030405060708090aL, ByteOrder.BIG_ENDIAN)) == BinaryData("030405060708090a"))
     assert(pr.tags.size == 4)
     assert(PaymentRequest.write(pr.sign(priv)) == ref)
-}
+  }
 
 
   test("On mainnet, with fallback (p2sh) address 3EktnHQD7RiAE6uzMj2ZifT9YgRrkSgzQX") {
@@ -151,5 +175,55 @@ class PaymentRequestSpec extends FunSuite {
     assert(pr.fallbackAddress === Some("bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"))
     assert(pr.tags.size == 3)
     assert(PaymentRequest.write(pr.sign(priv)) == ref)
+  }
+
+  test("On mainnet, with fallback (p2wsh) address bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3 and a minimum htlc cltv expiry of 12") {
+    val ref = "lnbc20m1pvjluezcqpvpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqsfp4qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q90qkf3gd7fcqs0ewr7t3xf72ptmc4n38evg0xhy4p64nlg7hgrmq6g997tkrvezs8afs0x0y8v4vs8thwsk6knkvdfvfa7wmhhpcsxcqw0ny48"
+    val pr = PaymentRequest.read(ref)
+    assert(pr.prefix == "lnbc")
+    assert(pr.amount == Some(MilliSatoshi(2000000000L)))
+    assert(pr.paymentHash == BinaryData("0001020304050607080900010203040506070809000102030405060708090102"))
+    assert(pr.timestamp == 1496314658L)
+    assert(pr.nodeId == PublicKey(BinaryData("03e7156ae33b0a208d0744199163177e909e80176e55d97a2f221ede0f934dd9ad")))
+    assert(pr.description == Right(Crypto.sha256("One piece of chocolate cake, one icecream cone, one pickle, one slice of swiss cheese, one slice of salami, one lollypop, one piece of cherry pie, one sausage, one cupcake, and one slice of watermelon".getBytes)))
+    assert(pr.fallbackAddress === Some("bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"))
+    assert(pr.minFinalCltvExpiry === Some(12))
+    assert(pr.tags.size == 4)
+    assert(PaymentRequest.write(pr.sign(priv)) == ref)
+  }
+
+  test("expiry is a variable-length unsigned value") {
+    val pr = PaymentRequest(Block.RegtestGenesisBlock.hash, Some(MilliSatoshi(100000L)), BinaryData("0001020304050607080900010203040506070809000102030405060708090102"),
+      priv, "test", fallbackAddress = None, expirySeconds = Some(21600), timestamp = System.currentTimeMillis() / 1000L)
+
+    val serialized = PaymentRequest write pr
+    val pr1 = PaymentRequest read serialized
+    assert(pr.expiry === Some(21600))
+  }
+
+  test("ignore unknown tags") {
+    // create a new tag that we don't know about
+    class MyExpiryTag(override val seconds: Long) extends ExpiryTag(seconds) {
+      // replace the tag with 'j'  which is not used yet
+      override def toInt5s = super.toInt5s.updated(0, Bech32.map('j'))
+    }
+
+    val pr = PaymentRequest(
+      prefix = "lntb",
+      amount = Some(MilliSatoshi(100000L)),
+      timestamp = System.currentTimeMillis() / 1000L,
+      nodeId = nodeId,
+      tags = List(
+        PaymentHashTag(BinaryData("01" * 32)),
+        DescriptionTag("description"),
+        new MyExpiryTag(42L)
+      ),
+      signature = BinaryData.empty).sign(priv)
+
+    val serialized = PaymentRequest write pr
+    val pr1 = PaymentRequest read serialized
+    val Some(unknownTag) = pr1.tags.collectFirst { case u: UnknownTag => u }
+    assert(unknownTag.tag == Bech32.map('j'))
+    assert(unknownTag.toInt5s == (new MyExpiryTag(42L)).toInt5s)
   }
 }
